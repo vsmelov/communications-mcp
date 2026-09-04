@@ -1,0 +1,55 @@
+# Архиватор избранных чатов Telegram.
+# Все паузы — секунды. Ко всем паузам добавляется случайный джиттер (jitter_frac).
+
+http_port: 8722
+
+chats:
+  # Чаты, которые архивируем целиком. query — то же, что принимает resolve_chat
+  # в MCP: числовой id, @username или кусок названия чата.
+  - query: "@some_username"
+  - query: "123456789"
+
+sync:
+  realtime_events: true     # события Telegram: новые сообщения в дампе за секунды
+  event_debounce_sec: 3     # шквал событий пишется на диск одним разом
+  poll_interval_sec: 300    # плановый проход-сверка (и двигатель бэкфилла)
+  jitter_frac: 0.25         # ±25% случайного разброса ко всем паузам
+  between_jobs_sec: 20      # пауза между плановыми проходами по разным чатам
+  history_wait_sec: 3       # пауза между запросами истории (Telegram отдаёт по 100 сообщений)
+  backfill_batch: 1200      # сколько старых сообщений докачивать за один проход
+  edit_window: 100          # сколько последних сообщений перечитывать (ловим правки)
+
+media:
+  max_mb: 10                    # вложения больше этого не качаем
+  per_cycle: 45                 # максимум вложений за один проход по чату
+  delay_sec: 3                  # пауза между скачиваниями вложений
+  video_note_source_max_mb: 100 # кружок с исходником больше этого даже не скачиваем
+  download_error_retries: 3     # сколько раз повторять неудачную загрузку (в разных проходах)
+
+transcribe:
+  enabled: true
+  provider: telegram            # telegram = бесплатно силами Telegram Premium (messages.transcribeAudio);
+                                # openai = платно через OpenAI STT (код сохранён, см. model/бюджет ниже)
+  model: gpt-4o-mini-transcribe # только для provider: openai ($0.003/мин)
+  kinds: [voice, video_notes, audio]  # telegram умеет только voice+video_notes; audio — только openai
+  per_cycle: 25                 # файлов за один проход чата (снижено: transcribe — самый флуд-чувствительный)
+  delay_sec: 7                  # пауза между запросами расшифровки: цель — ноль флудов
+  daily_budget_usd: 5.0         # стоп-кран для openai: не тратить больше за скользящие сутки
+  error_retries: 3              # сколько раз повторять неудачную расшифровку
+  drop_audio_after_transcript: true  # после расшифровки удалять сам аудиофайл (текст [speech] остаётся);
+                                     # false = хранить и текст, и аудио
+
+describe:
+  enabled: true
+  provider: openrouter
+  model: google/gemini-2.5-flash-lite  # дешёвая vision-модель (~$0.0002-0.0003/картинка)
+  kinds: [photos, documents]    # картинки (в т.ч. присланные документом) и PDF; zip/код не трогаем
+  per_cycle: 120                # файлов за один проход чата (OpenRouter, не Telegram — флуда нет)
+  delay_sec: 0.5                # пауза между запросами к модели
+  daily_budget_usd: 3.0         # стоп-кран: не тратить больше за скользящие сутки
+  error_retries: 3
+  max_mb: 10                    # не описывать (и не качать) файлы крупнее
+  drop_after: true              # после описания удалять файл (докачиваемо по msg_id); false = хранить
+  max_text_chars: 4000          # обрезка извлечённого текста PDF, чтобы не раздувать дамп
+  # prompt: |                   # раскомментируй, чтобы переопределить дефолтный (см. describe.DEFAULT_PROMPT)
+  #   Analyze this image ...

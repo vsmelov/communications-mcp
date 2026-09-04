@@ -10,6 +10,32 @@ WhatsApp-мост живёт в `whatsapp/`.
 > блокировки аккаунта вы берёте на себя. Файл `.session` — это полный доступ
 > к аккаунту: не коммитьте его и никому не передавайте.
 
+## Быстрый старт
+
+```bash
+git clone --recurse-submodules https://github.com/vsmelov/communications-mcp.git
+cd communications-mcp
+pip install -r requirements.txt
+python setup.py
+```
+
+`setup.py` ничего не скачивает и никуда не отправляет — только проверяет, что на
+месте, создаёт `.env` из шаблона и в конце печатает готовую команду подключения.
+Дальше:
+
+1. Возьми `api_id` / `api_hash` на [my.telegram.org](https://my.telegram.org)
+   (API development tools) и впиши в `.env`.
+2. `python server.py` — первый запуск спросит номер телефона и код из Telegram,
+   создаст `sessions/mcp.session` и на этом настройка закончена.
+3. `python setup.py` ещё раз — напечатает `claude mcp add` с путями твоей машины.
+
+Если Telegram недоступен напрямую, пропиши в `.env` цепочку подключения, например
+`TELEGRAM_PROXY_CHAIN=direct,http://127.0.0.1:10801` — техники пробуются по порядку
+до первой рабочей.
+
+WhatsApp-мост (`whatsapp/`) и фоновый архиватор чатов (`tg-archive/`) опциональны,
+у каждого свой README.
+
 ## Как устроено
 
 - `server.py` — MCP-сервер (FastMCP из официального `mcp` SDK).
@@ -274,3 +300,7 @@ copy sessions\mcp.session sessions\cursor.session
   `TELEGRAM_PROXY`.
 - Если сессия протухнет: удалите `sessions/mcp.session` и запустите `server.py`
   заново — он проведёт авторизацию с нуля.
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE).
