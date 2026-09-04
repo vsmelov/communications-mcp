@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tg-archive</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;background:#0f1115;color:#e6e6e6;max-width:960px;margin:1.5rem auto;padding:0 1rem}
+  h1{font-size:20px;margin:.2rem 0} h2{font-size:15px;color:#8b93a7;margin:1.4rem 0 .5rem}
+  .muted{color:#8b93a7} .err{color:#ff7b72} .ok{color:#7ee787} .warn{color:#e3b341}
+  .cards{display:flex;gap:12px;flex-wrap:wrap}
+  .card{background:#161a22;border:1px solid #2a2f3a;border-radius:10px;padding:.8rem 1rem;flex:1;min-width:280px}
+  .card h3{margin:.1rem 0 .5rem;font-size:15px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:.1rem .8rem}
+  .kv span:nth-child(odd){color:#8b93a7;white-space:nowrap}
+  .bar{height:6px;background:#2a2f3a;border-radius:3px;overflow:hidden;margin:.5rem 0}
+  .bar i{display:block;height:100%;background:#3d6fd9}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  td,th{padding:.25rem .5rem;border-bottom:1px solid #2a2f3a;text-align:left;vertical-align:top}
+  th{color:#8b93a7;font-weight:normal}
+  td.usd{white-space:nowrap;text-align:right}
+  #updated{float:right}
+  .pill{display:inline-block;padding:0 .5rem;border-radius:9px;background:#2a2f3a;font-size:12px;margin-left:.4rem}
+</style>
+
+<h1>tg-archive <span id="updated" class="muted"></span></h1>
+<div id="svc" class="muted">загрузка…</div>
+<div class="cards" id="chats"></div>
+<h2>Транскрибация · Описание (USD)</h2>
+<div class="cards" id="stt"></div>
+<h2>Последние обработки</h2>
+<table id="ledger"><thead><tr><th>когда</th><th>задача</th><th>чат</th><th>msg</th><th>модель</th><th>usd</th></tr></thead><tbody></tbody></table>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const ago = ts => {
+  if (!ts) return "—";
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if (s < 90) return Math.round(s) + " с назад";
+  if (s < 5400) return Math.round(s/60) + " мин назад";
+  return (s/3600).toFixed(1) + " ч назад";
+};
+
+function chatCard(c) {
+  const state = c.syncing_now ? '<span class="ok">синк идёт</span>'
+              : c.queued ? '<span class="warn">в очереди</span>'
+              : ago(c.last_sync_ts);
+  const cover = c.covered_utc ? `${c.covered_utc[0]} → ${c.covered_utc[1]}` : "—";
+  return `<div class="card"><h3>${esc(c.name || c.query)}
+      ${c.backfill_done ? '<span class="pill ok">вся история</span>' : '<span class="pill warn">бэкфилл идёт</span>'}</h3>
+    <div class="kv">
+      <span>сообщений</span><span>${c.messages ?? "—"}</span>
+      <span>покрытие UTC</span><span>${esc(cover)}</span>
+      <span>последний синк</span><span>${state}</span>
+      <span>медиа в очереди</span><span>${c.pending_media ?? "—"}</span>
+      <span>расшифровано</span><span>${c.transcribed ?? 0} (ждут: ${c.pending_transcripts ?? 0})</span>
+      <span>описано</span><span>${c.described ?? 0} (ждут: ${c.pending_describe ?? 0})</span>
+    </div></div>`;
+}
+
+function describeCard(d) {
+  const sp = d.spent || {};
+  const pct = d.daily_budget_usd ? Math.min(100, 100*(sp.day_usd||0)/d.daily_budget_usd) : 0;
+  const status = !d.enabled ? '<span class="err">выключено</span>'
+               : !d.active ? '<span class="warn">нет ключа</span>' : '<span class="ok">активно</span>';
+  return `<div class="card"><div class="kv">
+      <span>описание</span><span>${esc((d.model||"").replace("google/",""))} ${status}</span>
+      <span>всего</span><span>$${sp.total_usd ?? 0} (${sp.files ?? 0} файлов)</span>
+      <span>за сутки</span><span>$${sp.day_usd ?? 0} из $${d.daily_budget_usd}</span>
+      <span>за час</span><span>$${sp.hour_usd ?? 0}</span>
+    </div><div class="bar"><i style="width:${pct}%"></i></div></div>`;
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch("/status")).json();
+    const fw = s.flood_wait_until_ts ? ` · <span class="warn">FloodWait до ${new Date(s.flood_wait_until_ts*1000).toLocaleTimeString()}</span>` : "";
+    const err = s.last_error ? ` · <span class="err">${esc(s.last_error)}</span>` : ' · <span class="ok">ошибок нет</span>';
+    const rt = s.realtime_events ? ` · realtime: ${s.events_seen} событий` : "";
+    const fl = s.flood_hits_total
+      ? ` · <span class="warn">флудов: ${s.flood_hits_total} (посл.: ${esc(s.last_flood)})</span>`
+      : ' · <span class="ok">флудов: 0</span>';
+    $("svc").innerHTML = `запущен ${esc(s.started_utc)} UTC · очередь ${s.queue_len}${rt}${fl}${err}${fw}`;
+    $("chats").innerHTML = s.chats.map(chatCard).join("");
+
+    const t = s.transcribe || {}, sp = t.spent || {};
+    const pct = t.daily_budget_usd ? Math.min(100, 100*(sp.day_usd||0)/t.daily_budget_usd) : 0;
+    $("stt").innerHTML = `<div class="card"><div class="kv">
+        <span>провайдер</span><span>${t.provider === "telegram"
+            ? 'Telegram Premium <span class="ok">(бесплатно)</span>'
+            : esc(t.provider || "openai") + " / " + esc(t.model)}
+          ${t.enabled ? "" : '<span class="err">выключено</span>'}</span>
+        <span>всего</span><span>$${sp.total_usd ?? 0} (${sp.files ?? 0} файлов)</span>
+        <span>за сутки</span><span>$${sp.day_usd ?? 0} из $${t.daily_budget_usd}</span>
+        <span>за час</span><span>$${sp.hour_usd ?? 0}</span>
+      </div><div class="bar"><i style="width:${pct}%"></i></div></div>` + describeCard(s.describe || {});
+
+    const led = await (await fetch("/ledger?limit=30")).json();
+    $("ledger").querySelector("tbody").innerHTML = led.map(e =>
+      `<tr><td class="muted">${ago(e.ts)}</td><td>${esc(e.task)}${e.kind? " · "+esc(e.kind):""}</td>
+       <td>${esc(e.chat || e.chat_id)}</td><td>${e.msg_id}</td>
+       <td class="muted">${esc((e.model||"").replace("google/",""))}</td>
+       <td class="usd">$${(e.usd||0).toFixed(4)}</td></tr>`).join("");
+
+    $("updated").textContent = "обновлено " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("svc").innerHTML = `<span class="err">сервис не отвечает: ${esc(e)}</span>`;
+  }
+}
+refresh();
+setInterval(refresh, 10000);
+</script>

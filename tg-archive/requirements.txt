@@ -1,0 +1,11 @@
+telethon>=1.40
+pysocks>=1.7
+python-socks[asyncio]>=2.4
+aiohttp>=3.9
+PyYAML>=6.0
+python-dotenv>=1.0
+openai>=1.60
+pypdf>=4.0
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=0.6

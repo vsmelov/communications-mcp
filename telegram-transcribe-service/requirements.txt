@@ -1,0 +1,4 @@
+telethon==1.43.2
+python-socks[asyncio]==2.8.1
+fastapi==0.115.0
+uvicorn[standard]==0.30.6

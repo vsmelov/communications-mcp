@@ -1,0 +1,17 @@
+.env
+sessions/
+downloads/
+dumps/
+__pycache__/
+# любые Telethon-сессии (auth-ключи) — никогда в репу
+*.session
+*.session-journal
+# рантайм-данные компонентов
+tg-archive/data/
+telegram-transcribe-service/data/
+# whatsapp (GOWA) рантайм: сессия+база и медиа
+whatsapp/storages/
+whatsapp/statics/
+
+# локальный список архивируемых чатов (реальные id/имена) — не в git
+tg-archive/config.yaml*

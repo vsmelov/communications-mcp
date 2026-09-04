@@ -1,0 +1,15 @@
+services:
+  tg-archive:
+    build: .
+    container_name: tg-archive
+    # unless-stopped: контейнер поднимается сам при старте Docker Desktop
+    # (если его не останавливали руками через docker stop)
+    restart: unless-stopped
+    env_file:
+      - ../.env   # общие креды MCP: TELEGRAM_API_ID/HASH, OPENAI_API_KEY
+      - .env      # переопределения для контейнера (прокси через host.docker.internal)
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:8722:8722"

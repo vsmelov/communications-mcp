@@ -1,0 +1,22 @@
+services:
+  gowa:
+    build:
+      context: ./gowa
+      dockerfile: ./docker/golang.Dockerfile
+    container_name: communications-whatsapp
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200k"
+        max-file: "10"
+    ports:
+      # только localhost — наружу сервис не торчит
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - .env
+    volumes:
+      # сессия WhatsApp (signal-ключи) + база сообщений — бэкапить, не коммитить
+      - ./storages:/app/storages
+      # скачанные медиа
+      - ./statics:/app/statics
