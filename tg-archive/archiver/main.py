@@ -159,6 +159,7 @@ class Archiver:
         self._dirty: set[ChatSyncer] = set()   # чаты с несохранёнными событиями
         self._flush_task: asyncio.Task | None = None
         self.events_seen = 0
+        self.reconnects = 0
         self.flood_hits = 0
         self.last_flood: str | None = None
 
@@ -227,6 +228,37 @@ class Archiver:
                 log.exception("[%s] не смогли сохранить дамп после события", s.query)
             # медиа и транскрипт нового сообщения — лёгким заданием вне очереди
             self.enqueue(s, "event", EVENT_PRIORITY)
+
+    def _after_reconnect(self, exclude: ChatSyncer | None = None) -> None:
+        """Пока клиент был отключён, realtime-события не приходили, а catch_up
+        у нас нет (getDifference падает на чужих TL-конструкторах). Поэтому после
+        каждого восстановления связи — лёгкий проход по всем чатам: пропущенное за
+        разрыв доезжает за секунды, а не через poll_interval."""
+        self.reconnects += 1
+        for s in self.syncers:
+            if s is not exclude:
+                self.enqueue(s, "reconnect", EVENT_PRIORITY)
+
+    async def watchdog(self) -> None:
+        """Следит за соединением между заданиями: воркер переподключается только
+        когда стартует задание, а между плановыми проходами до 5 минут клиент мог
+        лежать отключённым — и терять события."""
+        was_connected = True
+        while True:
+            await asyncio.sleep(self.cfg.sync.watchdog_sec)
+            connected = self.client.is_connected()
+            if not connected:
+                if was_connected:
+                    log.warning("watchdog: клиент отключён — переподключаюсь")
+                try:
+                    await self.client.connect()
+                    connected = self.client.is_connected()
+                except Exception as exc:
+                    log.warning("watchdog: реконнект не удался: %s", str(exc).splitlines()[0][:120])
+            if connected and not was_connected:
+                log.info("watchdog: связь восстановлена — лёгкий проход по всем чатам")
+                self._after_reconnect()
+            was_connected = connected
 
     # ------------------------------------------------------------ enqueue --
     def enqueue(self, syncer: ChatSyncer, reason: str, priority: int) -> Job:
@@ -314,6 +346,7 @@ class Archiver:
             "last_error": self.last_error,
             "realtime_events": self.cfg.sync.realtime_events,
             "events_seen": self.events_seen,
+            "reconnects": self.reconnects,
             "transcribe": {
                 "enabled": self.cfg.transcribe.enabled,
                 "provider": self.cfg.transcribe.provider,
@@ -352,7 +385,8 @@ class Archiver:
                 if not self.client.is_connected():
                     log.info("клиент отключён — переподключаемся")
                     await self.client.connect()
-                light = job.reason in ("refresh", "event")
+                    self._after_reconnect(exclude=job.syncer)
+                light = job.reason in ("refresh", "event", "reconnect")
                 # обрыв соединения и короткий FloodWait — не повод ронять
                 # задание: пережидаем (флуд — срок + 20% буфера) и повторяем раз
                 for attempt in (1, 2):
@@ -370,6 +404,7 @@ class Archiver:
                         await asyncio.sleep(10)
                         if not self.client.is_connected():
                             await self.client.connect()
+                            self._after_reconnect(exclude=job.syncer)
                     except FloodWaitError as exc:
                         self._note_flood(exc)
                         if attempt == 2 or exc.seconds > 600:
@@ -472,7 +507,7 @@ async def amain() -> None:
     await site.start()
     log.info("HTTP API на порту %d (/status, /refresh, /health)", cfg.http_port)
 
-    await asyncio.gather(archiver.worker(), archiver.scheduler())
+    await asyncio.gather(archiver.worker(), archiver.scheduler(), archiver.watchdog())
 
 
 def main() -> None:

@@ -1,4 +1,4 @@
-telethon>=1.40
+telethon==1.43.2  # ПИН: 1.44.0 (layer 227) не читает историю/апдейты этой сессии — см. память tg-archive
 pysocks>=1.7
 python-socks[asyncio]>=2.4
 aiohttp>=3.9

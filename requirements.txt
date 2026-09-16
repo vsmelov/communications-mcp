@@ -1,4 +1,4 @@
-telethon>=1.40
+telethon==1.43.2  # ПИН: 1.44.0 (layer 227) ломает чтение на этой сессии
 mcp>=1.20
 python-dotenv>=1.0
 pysocks>=1.7

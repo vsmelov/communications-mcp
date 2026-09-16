@@ -37,6 +37,7 @@ class SyncCfg:
     edit_window: int = 100
     realtime_events: bool = True     # события Telegram: новые сообщения в дамп за секунды
     event_debounce_sec: float = 3.0  # копим шквал событий и пишем на диск одним разом
+    watchdog_sec: float = 10.0       # как часто проверять соединение; после реконнекта — лёгкий проход по всем чатам
 
 
 @dataclass

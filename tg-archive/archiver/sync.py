@@ -56,23 +56,44 @@ class ChatSyncer:
         if not root.is_dir():
             return
         q = self.query.casefold().lstrip("@")
-        for d in root.iterdir():
-            man_p = d / "manifest.json"
-            if not man_p.is_file():
+        # Папка чата — «<chat_id>-<slug>», где slug от названия чата. Название
+        # человек может сменить (Vadim Slavic -> Vadim), и тогда по свежему slug
+        # папки «нет»: 07.09.2026 так завёлся второй архив с нуля и бэкфилл
+        # 110k сообщений. Поэтому ищем по chat_id (префикс имени папки и
+        # manifest), а slug берём тот, под которым папка уже лежит на диске.
+        candidates = []
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
                 continue
-            try:
-                man = json.loads(man_p.read_text(encoding="utf-8"))
-            except Exception:
+            man = {}
+            man_p = d / "manifest.json"
+            if man_p.is_file():
+                try:
+                    man = json.loads(man_p.read_text(encoding="utf-8"))
+                except Exception:
+                    man = {}
+            chat_id = man.get("chat_id")
+            if chat_id is None and "-" in d.name and d.name.split("-", 1)[0].isdigit():
+                chat_id = int(d.name.split("-", 1)[0])
+            if chat_id is None:
                 continue
             match = (
-                q == str(man.get("chat_id"))
+                q == str(chat_id)
                 or q == ((man.get("archive") or {}).get("query") or "").casefold()
                 or (not q.isdigit() and q in (man.get("chat") or "").casefold())
             )
             if match:
-                self.store = ChatStore(root, man["chat_id"], man.get("slug") or "chat",
-                                       man.get("chat") or str(man["chat_id"]))
-                return
+                size = (d / "dump.unsafe.json").stat().st_size if (d / "dump.unsafe.json").is_file() else 0
+                candidates.append((size, d, chat_id, man))
+        if not candidates:
+            return
+        # если папок несколько (дубль после смены названия) — берём самую полную
+        size, d, chat_id, man = max(candidates, key=lambda c: c[0])
+        slug = man.get("slug") or d.name.split("-", 1)[1] if "-" in d.name else "chat"
+        self.store = ChatStore(root, chat_id, slug, man.get("chat") or str(chat_id))
+        if len(candidates) > 1:
+            log.warning("[%s] несколько папок архива для chat_id=%s: %s — использую %s",
+                        self.query, chat_id, [c[1].name for c in candidates], d.name)
 
     # ------------------------------------------------------------- helpers --
     async def _sleep(self, base: float) -> None:
@@ -84,10 +105,22 @@ class ChatSyncer:
                 int(self.query) if self.query.lstrip("-").isdigit() else self.query
             )
         if self.store is None:
+            # папка могла появиться/стать читаемой позже старта (bind mount) —
+            # ищем ещё раз уже по числовому id, и только потом заводим новую
+            self.query = str(self.entity.id) if self.query.lstrip("-").isdigit() else self.query
+            self._attach_store_from_disk()
+        if self.store is None:
             name = render.entity_name(self.entity)
             self.store = ChatStore(
                 self.cfg.chats_root, self.entity.id, render.slugify(name), name
             )
+        else:
+            # название чата могло смениться: обновляем имя, папку не переименовываем
+            name = render.entity_name(self.entity)
+            if name and name != self.store.chat_name:
+                log.info("[%s] чат переименован: %r -> %r (папка остаётся %s)",
+                         self.query, self.store.chat_name, name, self.store.dir.name)
+                self.store.chat_name = name
         self.store.archive_state["query"] = self.query
 
     async def _sender_name(self, msg) -> str | None:
