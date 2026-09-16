@@ -15,6 +15,9 @@
   сообщений собеседника = одно пробуждение Claude, а не пять.
 - При старте догоняет пропущенное с last_seen_id из --state (тоже одной пачкой), после эмиссии обновляет
   last_seen_id — перезапуск не дублирует. Всё эмитированное дописывается в --log (jsonl).
+- Сторож соединения раз в 30 с: Telethon переподключается сам, но молча, а молчание слушателя неотличимо от
+  «сообщений нет» — поэтому обрыв и восстановление печатаются явно, и после восстановления делается догон
+  (события, пришедшие без связи, до процесса не доходят).
 
 Формат stdout (для фильтра Monitor `^(BATCH|NEW |READY|LISTENING|Traceback|RuntimeError|ConnectionError|AuthKey|.*Error)`):
     READY connected via direct at 12:43:28
@@ -151,6 +154,9 @@ class Watcher:
         self.pending: dict[int, list] = {}
         self.timers: dict[int, asyncio.Task] = {}
         self.titles: dict[int, str] = {}
+        self.client = None
+        self.entities: list = []
+        self.ids: list[int] = []
 
     async def resolve(self, client, spec: str):
         spec = spec.strip()
@@ -195,19 +201,8 @@ class Watcher:
             entities.append(ent)
             ids.append(chat_id)
 
-        # догон с last_seen_id по каждому чату — одной пачкой на чат
-        for ent, chat_id in zip(entities, ids):
-            last = int(self.state.chat(chat_id).get("last_seen_id", 0))
-            missed = []
-            async for m in client.iter_messages(ent, min_id=last, reverse=True):
-                if await self.wanted(m):
-                    missed.append(m)
-            if missed:
-                self.flush(chat_id, missed, catchup=True)
-            elif not last:  # первый запуск без state: отсчёт с текущего конца истории
-                async for m in client.iter_messages(ent, limit=1):
-                    self.state.chat(chat_id)["last_seen_id"] = m.id
-                self.state.save()
+        self.client, self.entities, self.ids = client, entities, ids
+        await self.catchup(reason="старта")
 
         @client.on(events.NewMessage(chats=entities, incoming=True))
         async def handler(event):
@@ -222,7 +217,48 @@ class Watcher:
             self.timers[chat_id] = asyncio.create_task(self.wait_and_flush(chat_id))
 
         print(f"LISTENING {len(ids)} chat(s), пачки после {self.a.quiet} с тишины", flush=True)
+        asyncio.create_task(self.watchdog())
         await client.run_until_disconnected()
+
+    async def catchup(self, reason: str):
+        """Добрать пропущенное с last_seen_id по каждому чату — одной пачкой на чат.
+
+        Нужен и при старте, и после разрыва связи: пока соединения нет, события NewMessage
+        до процесса не доходят, и полагаться на них одних нельзя.
+        """
+        for ent, chat_id in zip(self.entities, self.ids):
+            last = int(self.state.chat(chat_id).get("last_seen_id", 0))
+            missed = []
+            try:
+                async for m in self.client.iter_messages(ent, min_id=last, reverse=True):
+                    if await self.wanted(m):
+                        missed.append(m)
+            except Exception as e:  # noqa: BLE001
+                print(f"ConnectionError: догон по «{self.titles.get(chat_id, chat_id)}» не удался: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                continue
+            if missed:
+                self.flush(chat_id, missed, catchup=True, reason=reason)
+            elif not last:  # первый запуск без state: отсчёт с текущего конца истории
+                async for m in self.client.iter_messages(ent, limit=1):
+                    self.state.chat(chat_id)["last_seen_id"] = m.id
+                self.state.save()
+
+    async def watchdog(self):
+        """Раз в 30 с проверяет соединение: Telethon переподключается сам, но делает это молча,
+        а молчание слушателя неотличимо от «сообщений нет». Печатает обе смены состояния и
+        после восстановления связи добирает пропущенное."""
+        was_connected = True
+        while True:
+            await asyncio.sleep(30)
+            now = self.client.is_connected()
+            if was_connected and not now:
+                print(f"ConnectionError: связь потеряна в {datetime.now():%H:%M:%S}, Telethon переподключается",
+                      flush=True)
+            elif now and not was_connected:
+                print(f"READY reconnected at {datetime.now():%H:%M:%S}", flush=True)
+                await self.catchup(reason="переподключения")
+            was_connected = now
 
     async def wait_and_flush(self, chat_id: int):
         try:
@@ -233,11 +269,11 @@ class Watcher:
         if batch:
             self.flush(chat_id, batch)
 
-    def flush(self, chat_id: int, batch: list, catchup: bool = False):
+    def flush(self, chat_id: int, batch: list, catchup: bool = False, reason: str = "старта"):
         ids = [m.id for m in batch]
         title = self.titles.get(chat_id, str(chat_id))
         print(f"BATCH {len(batch)} новых сообщений в «{title}» (ids {min(ids)}–{max(ids)})"
-              f"{' — догон после старта' if catchup else ''}, обработать вместе", flush=True)
+              f"{f' — догон после {reason}' if catchup else ''}, обработать вместе", flush=True)
         for m in batch:
             self.emit(chat_id, title, m)
         st = self.state.chat(chat_id)
