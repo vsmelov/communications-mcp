@@ -106,6 +106,17 @@ question in the context of one of those chats DO NOT page read_messages:
   1. call `archive_refresh(chat)` — it tops up the dump within seconds;
   2. Read/Grep the returned dump.md / dump.json paths directly.
 `archive_status()` lists which chats are archived and how fresh they are.
+
+CHAT WATCH (event-driven duty on a chat). When the user asks to "keep an eye
+on" a chat and react to new messages inside THIS session, do not poll
+read_messages on a timer. Run `tools/watch_chat.py` (in this server's folder)
+under the Monitor tool (persistent): it listens on a copy of the session,
+batches a person's consecutive messages (default 180 s of quiet = one
+wake-up), catches up from `--state` on restart, and prints `BATCH …` /
+`NEW {json}` lines to stdout; filter Monitor with the regex from
+`python tools/watch_chat.py --print-filter`. Then read, act, and reply with
+`send_message`. The Monitor lives only while the session is open. Details and
+the exact command: README.md, section «Дежурство по чату».
 """
 
 
