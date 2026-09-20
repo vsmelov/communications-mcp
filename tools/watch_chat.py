@@ -103,7 +103,8 @@ async def connect(session: str | None, tag: str) -> TelegramClient:
     api_hash = os.environ["TELEGRAM_API_HASH"]
     errors = []
     for technique in proxy_chain():
-        kwargs = {"timeout": 60}
+        # при обрыве сети Telethon по умолчанию сдаётся за 5 попыток × 1 с; держим соединение дольше
+        kwargs = {"timeout": 60, "connection_retries": 20, "retry_delay": 15, "auto_reconnect": True}
         pr = parse_proxy(technique)
         if pr:
             kwargs["proxy"] = pr
@@ -194,6 +195,30 @@ class Watcher:
         return True
 
     async def run(self):
+        """Живёт вечно: при обрыве, который Telethon не пережил, пересоздаёт клиент с паузой и догоняет пропущенное
+        (20.09.2026: ночной обрыв сети убивал процесс через ~5 мин ретраев)."""
+        delay = 60
+        while True:
+            try:
+                await self.run_once()
+                print("ConnectionError: Telethon отключился штатно — переподключаюсь через 60 с", flush=True)
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                print(f"ConnectionError: {type(e).__name__}: {str(e)[:120]} — переподключаюсь через {delay} с", flush=True)
+            except Exception as e:  # noqa: BLE001 — неизвестное тоже не должно убивать дежурство
+                print(f"Error: {type(e).__name__}: {str(e)[:160]} — переподключаюсь через {delay} с", flush=True)
+            if self.client is not None:
+                try:
+                    await self.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.client = None
+            for t in self.timers.values():
+                t.cancel()
+            self.timers.clear()
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 600)
+
+    async def run_once(self):
         client = await connect(self.a.session, Path(self.a.state).stem)
         entities, ids = [], []
         for spec in self.a.chat:
@@ -217,8 +242,11 @@ class Watcher:
             self.timers[chat_id] = asyncio.create_task(self.wait_and_flush(chat_id))
 
         print(f"LISTENING {len(ids)} chat(s), пачки после {self.a.quiet} с тишины", flush=True)
-        asyncio.create_task(self.watchdog())
-        await client.run_until_disconnected()
+        wd = asyncio.create_task(self.watchdog())
+        try:
+            await client.run_until_disconnected()
+        finally:
+            wd.cancel()
 
     async def catchup(self, reason: str):
         """Добрать пропущенное с last_seen_id по каждому чату — одной пачкой на чат.
@@ -249,8 +277,10 @@ class Watcher:
         а молчание слушателя неотличимо от «сообщений нет». Печатает обе смены состояния и
         после восстановления связи добирает пропущенное."""
         was_connected = True
-        while True:
+        while self.client is not None:
             await asyncio.sleep(30)
+            if self.client is None:
+                return
             now = self.client.is_connected()
             if was_connected and not now:
                 print(f"ConnectionError: связь потеряна в {datetime.now():%H:%M:%S}, Telethon переподключается",
