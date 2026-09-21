@@ -47,6 +47,12 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# Telethon при обрыве сети пишет WARNING на каждую попытку («Server closed the connection», «Attempt N at
+# connecting failed») — под Monitor каждая строка становится уведомлением. Обрыв и восстановление и так
+# печатает сторож ниже (по одной строке), поэтому от Telethon оставляем только ERROR и выше.
+import logging
+logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(name)s: %(message)s")
+logging.getLogger("telethon").setLevel(logging.ERROR)
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 
