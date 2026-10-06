@@ -15,3 +15,11 @@ whatsapp/statics/
 
 # локальный список архивируемых чатов (реальные id/имена) — не в git
 tg-archive/config.yaml*
+
+# кэш автовыбора сетевого пути (netpath.py)
+.netpath.json
+
+# дежурства: реестр (реальные id чатов и пути воркспейсов) и рантайм (маркеры Monitor, журнал действий) — не в git
+duties/registry.json*
+duties/.runtime/
+server.py.bak-*

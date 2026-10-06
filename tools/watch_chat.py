@@ -10,7 +10,9 @@
 - Telethon на КОПИИ сессии MCP (оригинал занят сервером), та же цепочка прокси, что у сервера
   (TELEGRAM_PROXY_CHAIN из .env).
 - Слушает один или несколько чатов (--chat: id, @username или подстрока названия диалога, можно повторять).
-- Только входящие; сообщения ботов пропускает (--include-bots, чтобы не пропускать).
+- Входящие; сообщения ботов пропускает (--include-bots, чтобы не пропускать). Плюс СВОИ исходящие, если текст
+  или подпись к медиа начинается с --trigger (по умолчанию `/ai`) — так владелец аккаунта зовёт Claude прямо
+  в чате; в NEW такие помечены "owner_call": true, в BATCH — «вызов владельца /ai».
 - Новые сообщения копятся и отдаются ПАЧКОЙ после --quiet секунд тишины (по умолчанию 180): одна серия
   сообщений собеседника = одно пробуждение Claude, а не пять.
 - При старте догоняет пропущенное с last_seen_id из --state (тоже одной пачкой), после эмиссии обновляет
@@ -18,6 +20,9 @@
 - Сторож соединения раз в 30 с: Telethon переподключается сам, но молча, а молчание слушателя неотличимо от
   «сообщений нет» — поэтому обрыв и восстановление печатаются явно, и после восстановления делается догон
   (события, пришедшие без связи, до процесса не доходят).
+- Сверка раз в WATCH_POLL_SEC (30 с) при живой связи: push-событие может не доехать и без обрыва, поэтому
+  история чатов сверяется с last_seen_id; пойманное выдаётся пачкой «догон после сверки». Дубли исключены:
+  выданное (id ≤ last_seen_id) и ждущее в пачке повторно не выдаётся. WATCH_POLL_SEC=0 — выключить.
 
 Формат stdout (для фильтра Monitor `^(BATCH|NEW |READY|LISTENING|Traceback|RuntimeError|ConnectionError|AuthKey|.*Error)`):
     READY connected via direct at 12:43:28
@@ -29,6 +34,11 @@
 Пример (Git Bash, из папки проекта, где лежит state):
     python C:/Users/v/PycharmProjects/claude-workspace/communications-mcp/tools/watch_chat.py \
         --chat 888793799 --chat -1004415463058 --state notes/watch_state.json --log notes/incoming.log
+
+ОТВЕТЫ. По умолчанию каждый ответ Claude в чате подписан премиум-эмодзи Claude + «**Claude:**» — слать через
+`tools/send_reply.py --chat <id> --text-file <файл> [--reply-to <msg_id>]` (MCP send_message кастомные эмодзи
+не умеет). Id эмодзи — `send_reply.CLAUDE_EMOJI_ID` (6273917097319865433). Голосовые/кружки — бесплатно через
+Telegram Premium: `tools/voice_text.py --chat <id> --id <msg_id>`.
 
 Monitor (persistent) на эту команду с `2>&1 | grep --line-buffered -E "<фильтр выше>"`. Monitor живёт только
 пока открыта сессия Claude — при новой сессии перезапустить.
@@ -54,9 +64,19 @@ import logging
 logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(name)s: %(message)s")
 logging.getLogger("telethon").setLevel(logging.ERROR)
 ROOT = Path(__file__).resolve().parents[1]
+CONNECTED_VIA = "?"
+# пульс в stdout раз в N секунд: строка ALIVE НЕ проходит фильтр Monitor (не будит Claude), но видна в логе —
+# чтобы по `tail notes/*_watch_stdout.log` было понятно, жив ли слушатель, а не гадать по тишине (04.10.2026)
+HEARTBEAT_SEC = int(os.getenv("WATCH_HEARTBEAT_SEC", "600"))
+# сверка с историей раз в N секунд при живой связи: push-событие Telegram может не доехать и без обрыва
+# (07.10.2026 сообщение Инны 8720409 не пришло событием, слушатель молчал) — сверка добирает такое за ≤N с
+POLL_SEC = int(os.getenv("WATCH_POLL_SEC", "30"))
 load_dotenv(ROOT / ".env")
 
-FILTER = r"^(BATCH|NEW |READY|LISTENING|Traceback|RuntimeError|ConnectionError|AuthKey|.*Error)"
+# В фильтр Monitor НЕ включаем строки NEW: каждая из них — отдельное уведомление, и на длинной пачке
+# (догон, болтливый чат) Monitor глушит слушателя за флуд — 25.09.2026 так снесло оба дежурства.
+# Приходит только BATCH (сколько сообщений и в каком чате), тексты читаются из --log и из дампа tg-archive.
+FILTER = r"^(BATCH|READY|LISTENING|Traceback|RuntimeError|ConnectionError|AuthKey|.*Error)"
 
 
 # ---------- сессия и прокси (как в server.py, без импорта сервера) ----------
@@ -76,7 +96,12 @@ def session_src(explicit: str | None) -> Path:
     return p
 
 
-def proxy_chain() -> list[str]:
+def proxy_chain(force: bool = False) -> list[str]:
+    # с 04.10.2026 — автовыбор живого пути (netpath.py: .env + системный прокси + порты VPN + direct)
+    if os.getenv("NETPATH_AUTO", "1") != "0":
+        sys.path.insert(0, str(ROOT))
+        import netpath
+        return netpath.candidates(force=force)
     raw = os.getenv("TELEGRAM_PROXY_CHAIN", "").strip()
     if raw:
         chain = [x.strip() for x in raw.split(",") if x.strip()]
@@ -108,7 +133,11 @@ async def connect(session: str | None, tag: str) -> TelegramClient:
     api_id = int(os.environ["TELEGRAM_API_ID"])
     api_hash = os.environ["TELEGRAM_API_HASH"]
     errors = []
-    for technique in proxy_chain():
+    tried = []
+    for technique in (t for force in (False, True) for t in proxy_chain(force)):  # пересканинг только если кэш не сработал
+        if technique in tried:
+            continue
+        tried.append(technique)
         # при обрыве сети Telethon по умолчанию сдаётся за 5 попыток × 1 с; держим соединение дольше
         kwargs = {"timeout": 60, "connection_retries": 20, "retry_delay": 15, "auto_reconnect": True}
         pr = parse_proxy(technique)
@@ -128,6 +157,8 @@ async def connect(session: str | None, tag: str) -> TelegramClient:
             await client.disconnect()
             raise RuntimeError("session not authorized — перелогиньтесь (relogin_desktop.py)")
         print(f"READY connected via {technique} at {datetime.now():%H:%M:%S}", flush=True)
+        global CONNECTED_VIA
+        CONNECTED_VIA = technique
         return client
     raise RuntimeError("unreachable: " + " | ".join(errors))
 
@@ -164,6 +195,7 @@ class Watcher:
         self.client = None
         self.entities: list = []
         self.ids: list[int] = []
+        self.catch_lock = asyncio.Lock()
 
     async def resolve(self, client, spec: str):
         spec = spec.strip()
@@ -188,9 +220,17 @@ class Watcher:
         print(f"READY chat resolved: {title} (id {chat_id})", flush=True)
         return ent, chat_id
 
+    def owner_call(self, m) -> bool:
+        """Исходящее сообщение владельца аккаунта, текст/подпись которого начинается с триггера (/ai) —
+        так Владимир сам зовёт Claude прямо в чате (04.10.2026). Ответы Claude начинаются с «🤖 Claude:»,
+        поэтому сами себя не вызывают."""
+        if not m.out or not self.a.trigger:
+            return False
+        return (m.message or "").lstrip().lower().startswith(self.a.trigger.lower())
+
     async def wanted(self, m) -> bool:
         if m.out:
-            return False
+            return self.owner_call(m)
         if not self.a.include_bots:
             try:
                 s = await m.get_sender()
@@ -206,6 +246,9 @@ class Watcher:
         delay = 60
         while True:
             try:
+                # конфиг мог поменяться, пока мы висели в ретраях: 03.10.2026 процесс четверо суток
+                # долбился в мёртвый прокси, хотя в .env уже была живая цепочка. Перечитываем каждый раз.
+                load_dotenv(ROOT / ".env", override=True)
                 await self.run_once()
                 print("ConnectionError: Telethon отключился штатно — переподключаюсь через 60 с", flush=True)
             except (ConnectionError, OSError, asyncio.TimeoutError) as e:
@@ -235,59 +278,119 @@ class Watcher:
         self.client, self.entities, self.ids = client, entities, ids
         await self.catchup(reason="старта")
 
-        @client.on(events.NewMessage(chats=entities, incoming=True))
+        @client.on(events.NewMessage(chats=entities))  # и исходящие: owner_call() пропускает только /ai
         async def handler(event):
             m = event.message
-            if not await self.wanted(m):
-                return
             chat_id = event.chat_id
+            if self.seen(chat_id, m.id) or not await self.wanted(m):
+                return  # уже выдано сверкой/догоном или ждёт в пачке
+            if self.seen(chat_id, m.id):
+                return  # сверка успела выдать, пока wanted() ходил за отправителем
+            asyncio.create_task(self.ack(m))
             self.pending.setdefault(chat_id, []).append(m)
             t = self.timers.get(chat_id)
             if t is not None:
                 t.cancel()
             self.timers[chat_id] = asyncio.create_task(self.wait_and_flush(chat_id))
 
-        print(f"LISTENING {len(ids)} chat(s), пачки после {self.a.quiet} с тишины", flush=True)
+        print(f"LISTENING {len(ids)} chat(s), пачки после {self.a.quiet} с тишины; "
+              f"отвечать через tools/send_reply.py (подпись эмодзи Claude по умолчанию), "
+              f"голосовые — tools/voice_text.py", flush=True)
         wd = asyncio.create_task(self.watchdog())
+        pl = asyncio.create_task(self.poller()) if POLL_SEC > 0 else None
         try:
             await client.run_until_disconnected()
         finally:
             wd.cancel()
+            if pl is not None:
+                pl.cancel()
+
+    async def ack(self, m):
+        """Мгновенная реакция (по умолчанию 👀) на сообщение, ушедшее Claude: собеседник сразу видит, что его
+        услышали, пока Claude думает над ответом (04.10.2026). Ошибка реакции дежурство не роняет."""
+        if not self.a.ack:
+            return
+        try:
+            from telethon.tl.functions.messages import SendReactionRequest
+            from telethon.tl.types import ReactionEmoji
+            await self.client(SendReactionRequest(peer=await m.get_input_chat(), msg_id=m.id,
+                                                  reaction=[ReactionEmoji(emoticon=self.a.ack)]))
+        except Exception as e:  # noqa: BLE001
+            print(f"ACK failed for {m.id}: {type(e).__name__}: {str(e)[:100]}", flush=True)
 
     async def catchup(self, reason: str):
         """Добрать пропущенное с last_seen_id по каждому чату — одной пачкой на чат.
 
-        Нужен и при старте, и после разрыва связи: пока соединения нет, события NewMessage
-        до процесса не доходят, и полагаться на них одних нельзя.
+        Нужен и при старте, и после разрыва связи, и периодически (сверка): пока соединения нет, события
+        NewMessage до процесса не доходят, а иногда не доходят и при живой связи.
         """
+        async with self.catch_lock:  # сверка и догон после переподключения не должны идти одновременно
+            await self._catchup(reason)
+
+    async def _catchup(self, reason: str):
         for ent, chat_id in zip(self.entities, self.ids):
             last = int(self.state.chat(chat_id).get("last_seen_id", 0))
+            if not last:
+                # первый запуск без state: отсчёт с текущего конца истории. Без этого min_id=0
+                # означает «всю историю» и первая же пачка выдавала сотни старых сообщений
+                # (25.09.2026, чат Инны: 570 штук).
+                async for m in self.client.iter_messages(ent, limit=1):
+                    self.state.chat(chat_id)["last_seen_id"] = m.id
+                self.state.save()
+                print(f"READY «{self.titles.get(chat_id, chat_id)}»: первый запуск, "
+                      f"старт с id {self.state.chat(chat_id).get('last_seen_id', 0)}", flush=True)
+                continue
             missed = []
             try:
                 async for m in self.client.iter_messages(ent, min_id=last, reverse=True):
-                    if await self.wanted(m):
+                    if not self.seen(chat_id, m.id) and await self.wanted(m):
                         missed.append(m)
             except Exception as e:  # noqa: BLE001
                 print(f"ConnectionError: догон по «{self.titles.get(chat_id, chat_id)}» не удался: "
                       f"{type(e).__name__}: {e}", flush=True)
                 continue
+            missed = [m for m in missed if not self.seen(chat_id, m.id)]  # событие могло успеть раньше
             if missed:
                 self.flush(chat_id, missed, catchup=True, reason=reason)
-            elif not last:  # первый запуск без state: отсчёт с текущего конца истории
-                async for m in self.client.iter_messages(ent, limit=1):
-                    self.state.chat(chat_id)["last_seen_id"] = m.id
-                self.state.save()
+                if reason != "старта":  # на старте реакция на старое не нужна
+                    for m in missed:
+                        asyncio.create_task(self.ack(m))
+
+    def seen(self, chat_id: int, msg_id: int) -> bool:
+        """Сообщение уже выдано (id ≤ last_seen_id) или лежит в копящейся пачке — чтобы событие и сверка
+        не выдали одно и то же дважды."""
+        if msg_id <= int(self.state.chat(chat_id).get("last_seen_id", 0)):
+            return True
+        return any(p.id == msg_id for p in self.pending.get(chat_id, []))
+
+    async def poller(self):
+        """Раз в POLL_SEC при живой связи сверяет историю чатов с last_seen_id (один лёгкий запрос на чат):
+        страховка от недоставленных push-событий. Пойманное печатается как «догон после сверки»."""
+        while self.client is not None:
+            await asyncio.sleep(POLL_SEC)
+            if self.client is None or not self.client.is_connected():
+                continue
+            try:
+                await self.catchup(reason="сверки")
+            except Exception as e:  # noqa: BLE001 — сверка не должна ронять дежурство
+                print(f"ConnectionError: сверка не удалась: {type(e).__name__}: {str(e)[:120]}", flush=True)
 
     async def watchdog(self):
         """Раз в 30 с проверяет соединение: Telethon переподключается сам, но делает это молча,
         а молчание слушателя неотличимо от «сообщений нет». Печатает обе смены состояния и
         после восстановления связи добирает пропущенное."""
         was_connected = True
+        last_beat = asyncio.get_running_loop().time()
         while self.client is not None:
             await asyncio.sleep(30)
             if self.client is None:
                 return
             now = self.client.is_connected()
+            if asyncio.get_running_loop().time() - last_beat >= HEARTBEAT_SEC:
+                last_beat = asyncio.get_running_loop().time()
+                seen = ", ".join(f"«{self.titles.get(i, i)}» last_seen_id {self.state.chat(i).get('last_seen_id', 0)}"
+                                 for i in self.ids)
+                print(f"ALIVE {datetime.now():%H:%M:%S} connected={now} via {CONNECTED_VIA}; {seen}", flush=True)
             if was_connected and not now:
                 print(f"ConnectionError: связь потеряна в {datetime.now():%H:%M:%S}, Telethon переподключается",
                       flush=True)
@@ -308,7 +411,9 @@ class Watcher:
     def flush(self, chat_id: int, batch: list, catchup: bool = False, reason: str = "старта"):
         ids = [m.id for m in batch]
         title = self.titles.get(chat_id, str(chat_id))
+        calls = sum(1 for m in batch if self.owner_call(m))
         print(f"BATCH {len(batch)} новых сообщений в «{title}» (ids {min(ids)}–{max(ids)})"
+              f"{f', из них {calls} — вызов владельца {self.a.trigger}' if calls else ''}"
               f"{f' — догон после {reason}' if catchup else ''}, обработать вместе", flush=True)
         for m in batch:
             self.emit(chat_id, title, m)
@@ -326,6 +431,10 @@ class Watcher:
                "text": (m.message or "")[:2000],
                "media": (type(m.media).__name__ if m.media else None),
                "file": getattr(getattr(m, "file", None), "name", None)}
+        if self.owner_call(m):
+            # владелец аккаунта позвал Claude в чате: текст после триггера — его задание, ответ — в этот же чат
+            rec["owner_call"] = True
+            rec["from"] = f"владелец аккаунта ({self.a.trigger})"
         line = "NEW " + json.dumps(rec, ensure_ascii=False)
         print(line, flush=True)
         if self.log:
@@ -340,8 +449,14 @@ def main():
                     help="id (в т.ч. -100… для супергрупп), @username или подстрока названия; можно повторять")
     ap.add_argument("--state", help="json с last_seen_id по чатам (создаётся сам)")
     ap.add_argument("--log", help="jsonl-журнал всех эмитированных сообщений")
-    ap.add_argument("--quiet", type=int, default=180, help="секунд тишины перед выдачей пачки (180)")
+    # с 04.10.2026 по умолчанию 0: каждое сообщение отдаётся сразу, а докинутое во время ответа Claude получает
+    # посреди хода как новое уведомление Monitor и учитывает. Ждать тишину (раньше 180 с) — только тормозило ответ.
+    ap.add_argument("--quiet", type=int, default=0, help="секунд тишины перед выдачей пачки (0 = сразу)")
     ap.add_argument("--include-bots", action="store_true", help="не пропускать сообщения ботов")
+    ap.add_argument("--ack", default="👀", help="реакция на каждое сообщение, ушедшее Claude ('' — без реакции)")
+    ap.add_argument("--trigger", default="/ai",
+                    help="свои исходящие с этого префикса (текст или подпись) тоже отдавать Claude — вызов владельцем; "
+                         "'' — выключить (по умолчанию /ai)")
     ap.add_argument("--session", help="путь к .session (по умолчанию TELEGRAM_SESSION, иначе sessions/desktop.session)")
     ap.add_argument("--print-filter", action="store_true", help="напечатать регулярку для фильтра Monitor и выйти")
     a = ap.parse_args()

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Дежурства по чатам</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%231a7f37'/%3E%3Cpath d='M10 16.5l4 4 8-9' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<a class="skip" href="#duties">Перейти к дежурствам</a>
+<header class="top">
+  <div class="brand">
+    <h1>Дежурства по чатам</h1>
+    <p class="muted small" id="updated">загрузка…</p>
+  </div>
+  <div class="top-links">
+    <a id="archiveLink" href="http://127.0.0.1:8722/" target="_blank" rel="noopener noreferrer">Архиватор tg-archive</a>
+    <span id="archiveState" class="pill">проверяю…</span>
+    <span id="archiveAge" class="muted small"></span>
+  </div>
+</header>
+
+<main id="main">
+  <section class="summary" id="summary" aria-label="Сводка"></section>
+
+  <section class="alerts" aria-labelledby="alertsTitle">
+    <h2 id="alertsTitle" class="visually-hidden">Тревоги</h2>
+    <ul id="alerts" class="alert-list" aria-live="polite"></ul>
+  </section>
+
+  <div class="toolbar">
+    <label class="check">
+      <input type="checkbox" id="showText">
+      <span>Показывать тексты сообщений в хвостах stdout</span>
+    </label>
+    <button type="button" id="refreshBtn" class="btn btn-quiet">Обновить сейчас</button>
+  </div>
+
+  <section aria-labelledby="dutiesTitle">
+    <h2 id="dutiesTitle">Активные дежурства</h2>
+    <div id="duties" class="cards"></div>
+    <p id="noDuties" class="muted" hidden>Активных дежурств нет — заведите новое ниже.</p>
+  </section>
+
+  <section id="foundSection" aria-labelledby="foundTitle" hidden>
+    <h2 id="foundTitle">Найдены слушатели, не заведённые в реестр</h2>
+    <p class="muted small">Процессы <code>watch_chat.py</code>, чьего state-файла нет в реестре. «Завести» подставит их
+      пути в форму ниже — работающий слушатель не перезапускается.</p>
+    <ul id="found" class="found-list"></ul>
+  </section>
+
+  <section aria-labelledby="addTitle" class="panel" id="addSection">
+    <h2 id="addTitle">Новое дежурство</h2>
+    <p id="adoptNote" class="notice" hidden></p>
+    <form id="addForm" novalidate>
+      <div class="grid2">
+        <label>Имя (латиница, для реестра и файлов)
+          <input name="name" required pattern="[a-z0-9][a-z0-9_\-]{0,39}" autocomplete="off" placeholder="например, olga">
+        </label>
+        <label>Чат: id, @username или часть названия; несколько — через запятую
+          <input name="chat" required autocomplete="off" placeholder="473364365 или -100…">
+        </label>
+        <label>Заголовок (по умолчанию — название чата)
+          <input name="title" autocomplete="off">
+        </label>
+        <label>Воркспейс (пусто — claude-workspace\&lt;имя&gt;)
+          <input name="workspace" autocomplete="off">
+        </label>
+        <label>Триггер владельца
+          <input name="trigger" value="/ai" autocomplete="off">
+        </label>
+        <label>Пачка после N секунд тишины (0 — сразу)
+          <input name="quiet" type="number" min="0" max="3600" value="0">
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" name="sign" checked> <span>Ответы с подписью «Claude:» и эмодзи</span></label>
+      <label class="check" id="startWrap"><input type="checkbox" name="start"> <span>Сразу запустить слушатель</span></label>
+      <label>Заметки
+        <textarea name="notes" rows="2"></textarea>
+      </label>
+      <input type="hidden" name="adopt">
+      <input type="hidden" name="state">
+      <input type="hidden" name="log">
+      <input type="hidden" name="stdout">
+      <div class="actions">
+        <button type="submit" class="btn btn-primary">Завести дежурство</button>
+        <button type="reset" class="btn btn-quiet" id="resetBtn">Очистить</button>
+      </div>
+      <p class="muted small">Создаст папку и <code>README.md</code> из шаблона правил (если README ещё нет), запишет в реестр
+        и вернёт команду для тула Monitor. Monitor запускает сама сессия агента — сервер этого сделать не может.</p>
+    </form>
+    <div id="addResult" class="result" hidden></div>
+  </section>
+
+  <section aria-labelledby="archivedTitle">
+    <details id="archived">
+      <summary><h2 id="archivedTitle" class="inline">Неактивные (архив)</h2> <span id="archivedCount" class="muted"></span></summary>
+      <div id="archivedList" class="cards"></div>
+    </details>
+  </section>
+
+  <section aria-labelledby="hygieneTitle" class="panel quiet">
+    <h2 id="hygieneTitle">Гигиена процессов</h2>
+    <p id="hygiene" class="small"></p>
+  </section>
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

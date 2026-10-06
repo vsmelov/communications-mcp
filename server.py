@@ -177,7 +177,20 @@ def _parse_proxy(raw: str) -> tuple | None:
     return (ptype, u.hostname or "127.0.0.1", u.port or 1080)
 
 
-def _proxy_chain() -> list[str]:
+def _proxy_chain(force: bool = False) -> list[str]:
+    """Техники подключения по порядку до первой рабочей.
+
+    С 04.10.2026 по умолчанию — автовыбор netpath.candidates(): .env-цепочка + системный прокси Windows +
+    слушающиеся порты VPN-клиентов + direct, всё проверено параллельно, быстрые первыми (кэш 10 мин;
+    force=True — пересканировать). NETPATH_AUTO=0 возвращает старое поведение ниже.
+    """
+    if os.getenv("NETPATH_AUTO", "1") != "0":
+        import netpath
+        return netpath.candidates(force=force)
+    return _static_chain()
+
+
+def _static_chain() -> list[str]:
     """Техники подключения по порядку до первой рабочей (как в tg-archive).
 
     TELEGRAM_PROXY_CHAIN (через запятую: direct, http://..., socks5://...)
@@ -231,7 +244,7 @@ async def get_client() -> TelegramClient:
 
     api_id = int(os.environ["TELEGRAM_API_ID"])
     api_hash = os.environ["TELEGRAM_API_HASH"]
-    timeout = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "30"))
+    timeout = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "10"))
     session = str(_session_path())
 
     # уже был клиент (например, отвалился коннект) — пробуем поднять его же
@@ -244,8 +257,18 @@ async def get_client() -> TelegramClient:
             logging.warning("telegram reconnect failed: %s", e)
 
     errors: list[str] = []
-    for technique in _proxy_chain():
-        kwargs: dict = {"timeout": timeout}
+    def techniques():
+        # сначала кэш netpath; если ни одна не подключилась — пересканировать сеть (VPN мог смениться)
+        tried: set[str] = set()
+        for force in (False, True):
+            for t in _proxy_chain(force=force):
+                if t not in tried:
+                    tried.add(t)
+                    yield t
+
+    for technique in techniques():
+        # одна попытка на технику: Telethon по умолчанию ретраит 5 раз, и мёртвый путь съедал весь таймаут MCP
+        kwargs: dict = {"timeout": timeout, "connection_retries": 1}
         proxy = _parse_proxy(technique)
         if proxy:
             kwargs["proxy"] = proxy
@@ -1391,6 +1414,135 @@ async def archive_refresh(chat: str, timeout_sec: float = 120) -> dict:
                 result["files"] = {"md": e["dump_md"], "json": e["dump_json"], "dir": e["dir"]}
                 break
     return result
+
+
+#
+# ------------------------------------------------------------- duties -------
+#
+# Дежурства по чатам: слушатель tools/watch_chat.py (отдельный процесс Windows) + агент — сессия Claude под
+# тулом Monitor. Ядро — пакет duties/ (stdlib + psutil): реестр, статус, тревоги, старт/стоп, команда Monitor.
+# Импорт ЛЕНИВЫЙ внутри каждого тула: если ядро сломано, остальные инструменты сервера работают как раньше,
+# а эти отвечают {"ok": false, "error": ...}. Дашборд — http://127.0.0.1:18210/ (duty_dashboard).
+# Подробно — README.md, раздел «Дежурства: дашборд и MCP».
+
+
+async def _duty_call(fn_name: str, *args, **kwargs) -> dict:
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from duties import api as _duty_api
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"ядро дежурств не загрузилось: {type(exc).__name__}: {exc}"}
+    try:
+        return await asyncio.to_thread(getattr(_duty_api, fn_name), *args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{fn_name}: {type(exc).__name__}: {exc}"}
+
+
+@mcp.tool()
+async def duty_list() -> dict:
+    """Дежурства по чатам — сводка по всем, без сети (только процессы и файлы).
+
+    Возвращает {summary, duties: [{name, title, level (green/yellow/red/grey), listener, heartbeat, connection,
+    agent, incoming_today, pending, alerts}], unregistered (живые слушатели не из реестра), global_alerts, orphans}.
+    """
+    return await _duty_call("list_duties")
+
+
+@mcp.tool()
+async def duty_status(name: str) -> dict:
+    """Полный статус одного дежурства: слушатель (PID, аптайм, устарел ли код), пульс ALIVE, связь с Telegram,
+    агент (какая сессия держит Monitor, ссылка на неё), входящие, «ожидает ответа», тревоги, пути файлов.
+    Тексты сообщений не возвращаются."""
+    return await _duty_call("duty_status", name)
+
+
+@mcp.tool()
+async def duty_start(name: str) -> dict:
+    """Запустить слушатель дежурства отдельным скрытым процессом Windows (переживает сессию и лимит 2 ч).
+    Второй слушатель на тот же state не запускает. Возвращает {ok, pid, command, stdout} или {ok: false, error}."""
+    return await _duty_call("start", name)
+
+
+@mcp.tool()
+async def duty_stop(name: str) -> dict:
+    """Остановить слушатель дежурства (только процессы, подтверждённо являющиеся его watch_chat.py с этим state).
+    Файлы state/log/stdout не трогаются. Возвращает {ok, stopped: [pid], failed}."""
+    return await _duty_call("stop", name)
+
+
+@mcp.tool()
+async def duty_restart(name: str) -> dict:
+    """Перезапустить слушатель дежурства (стоп + старт; пропущенное догонится по state). Возвращает {ok, stop, start}."""
+    return await _duty_call("restart", name)
+
+
+@mcp.tool()
+async def duty_add(name: str, chat: str, workspace: str = "", title: str = "", start: bool = False,
+                   quiet: int = 0, trigger: str = "/ai", sign: bool = True, notes: str = "") -> dict:
+    """Завести новое дежурство: папка воркспейса + notes/ + README.md из шаблона правил (если README нет),
+    запись в реестр, по желанию — старт слушателя.
+
+    Args:
+        name: короткое имя латиницей (amir, olga-shop) — для реестра и файлов notes/<name>_*.
+        chat: id чата (супергруппы как -100…), @username или подстрока названия; несколько — через запятую.
+        workspace: папка воркспейса (пусто — claude-workspace/<name>; относительный путь — от claude-workspace).
+        title: заголовок карточки (пусто — название чата).
+        start: сразу запустить слушатель.
+        quiet: секунд тишины перед выдачей пачки (0 — сразу), trigger: префикс вызова владельцем (/ai),
+        sign: ответы с подписью «Claude:» (влияет на шаблон README), notes: заметка в реестр.
+
+    Возвращает {ok, workspace, readme, paths, monitor_command: {command, description, timeout_ms}, reminder}.
+    Monitor запускает сама сессия агента — сервер этого сделать не может."""
+    return await _duty_call("add", name=name, chat=chat, workspace=workspace, title=title, start_now=start,
+                            quiet=quiet, trigger=trigger, sign=sign, notes=notes)
+
+
+@mcp.tool()
+async def duty_remove(name: str, stop_listener: bool = False) -> dict:
+    """Убрать дежурство из реестра (файлы воркспейса не удаляются). Если слушатель работает — нужен
+    stop_listener=True (иначе ошибка). Возвращает {ok, removed, stopped}."""
+    return await _duty_call("remove", name, stop_listener)
+
+
+@mcp.tool()
+async def duty_attach(name: str, session_id: str = "", session_title: str = "") -> dict:
+    """Агент сообщает, что на дежурстве именно он — вызвать один раз после запуска Monitor.
+
+    session_id можно не передавать: сервер возьмёт сессию, из которой пришёл вызов. Дашборд покажет её
+    название и ссылку «Открыть сессию». Возвращает {ok, agent: {session_id, title, link}, monitor_command}."""
+    return await _duty_call("attach", name, session_id, session_title)
+
+
+@mcp.tool()
+async def duty_monitor_command(name: str) -> dict:
+    """Готовая команда для тула Monitor (persistent): стартовый статус + tail stdout слушателя с фильтром
+    watch_chat.py --print-filter; при перевзводе догоняет пачки, пришедшие в паузе; tail умирает вместе с Monitor.
+    name — имя или несколько через запятую (один Monitor на несколько дежурств).
+    Возвращает {command, description, timeout_ms: 1800000, rearm, attach}."""
+    return await _duty_call("monitor_command", name)
+
+
+@mcp.tool()
+async def duty_tail(name: str, lines: int = 30, show_text: bool = False) -> dict:
+    """Последние строки stdout слушателя (до 500). Тексты сообщений (строки NEW) по умолчанию скрыты —
+    только id/время/тип; show_text=True — показать. Возвращает {lines, masked, file, updated}."""
+    return await _duty_call("tail", name, lines, show_text)
+
+
+@mcp.tool()
+async def duty_handled(name: str, up_to_id: int = 0, chat_id: int = 0, note: str = "") -> dict:
+    """Пометить входящие дежурства до up_to_id (включительно) обработанными без ответа — чтобы не висели в
+    «ожидает ответа» (личное владельцу, «спасибо»). up_to_id=0 — всё, что пришло на сейчас; chat_id=0 — все чаты.
+    Возвращает {ok, up_to_id, journal}."""
+    return await _duty_call("handled", name, up_to_id, chat_id or None, note)
+
+
+@mcp.tool()
+async def duty_dashboard() -> dict:
+    """Поднять веб-дашборд дежурств (скрытый отдельный процесс, singleton), если не запущен.
+    Возвращает {ok, url: http://127.0.0.1:18210/, started}."""
+    return await _duty_call("dashboard")
 
 
 if __name__ == "__main__":

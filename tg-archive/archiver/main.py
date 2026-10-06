@@ -492,6 +492,20 @@ async def amain() -> None:
     me = await client.get_me()
     log.info("вошли как %s (id=%s), чатов в конфиге: %d",
              me.username or me.first_name, me.id, len(cfg.chats))
+    # свежая сессия (новый auth_key) не знает access_hash чужих юзеров —
+    # get_entity(int) по голому id падает, пока кэш сущностей не прогрет
+    # хотя бы одним проходом по диалогам.
+    # На прогреве временно даём Telethon самому спать на FloodWait:
+    # иначе при threshold=0 исключение рвёт пагинацию, ретрай с нуля
+    # снова бьёт в лимит на первой странице и HTTP так и не стартует.
+    prev_threshold = client.flood_sleep_threshold
+    client.flood_sleep_threshold = 24 * 3600
+    try:
+        log.info("прогрев кэша диалогов…")
+        await client.get_dialogs(limit=None)
+        log.info("прогрев кэша диалогов готов")
+    finally:
+        client.flood_sleep_threshold = prev_threshold
 
     archiver = Archiver(client, cfg)
     if cfg.sync.realtime_events:
