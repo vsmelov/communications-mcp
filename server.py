@@ -219,7 +219,18 @@ def _proxy() -> tuple | None:
     return _parse_proxy(_proxy_chain()[0])
 
 
+_session_cached: Path | None = None
+
+
 def _session_path() -> Path:
+    """Session file to use, without the .session suffix (made once per process)."""
+    global _session_cached
+    if _session_cached is None:
+        _session_cached = _resolve_session_path()
+    return _session_cached
+
+
+def _resolve_session_path() -> Path:
     """Session file to use, without the .session suffix.
 
     Override with TELEGRAM_SESSION when more than one MCP client runs this
@@ -227,17 +238,64 @@ def _session_path() -> Path:
     fight over locks. Give each client its own copy.
     """
     raw = os.getenv("TELEGRAM_SESSION", "").strip()
-    if not raw:
-        return ROOT / "sessions" / "mcp"
-    p = Path(raw).expanduser()
-    if p.suffix == ".session":
-        p = p.with_suffix("")
-    return p if p.is_absolute() else ROOT / p
+    if raw:
+        p = Path(raw).expanduser()
+        if p.suffix == ".session":
+            p = p.with_suffix("")
+        return p if p.is_absolute() else ROOT / p
+    return _private_copy(ROOT / "sessions" / "mcp")
+
+
+def _private_copy(master: Path) -> Path:
+    """Per-process copy of the shared session file.
+
+    Every Claude session starts its own server.py, and all of them opened
+    sessions/mcp.session: Telethon keeps that SQLite file open and writes to it,
+    so a second process got `database is locked` - which surfaced as "Telegram
+    unreachable" although the network was fine. A copy carries the same
+    auth_key (one authorization, nothing new in the device list), so each
+    process just gets its own file. Copies of processes that are gone are
+    removed: on Windows an open file cannot be deleted, so a failed unlink means
+    its owner is still running.
+    """
+    import sqlite3
+
+    run = master.parent / "run"
+    run.mkdir(exist_ok=True)
+    for old in run.glob("mcp-*.session*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    copy = run / f"mcp-{os.getpid()}"
+    src = sqlite3.connect(f"file:{master}.session?mode=ro", uri=True, timeout=30)
+    try:
+        dst = sqlite3.connect(f"{copy}.session")
+        try:
+            src.backup(dst)   # consistent snapshot even while another process writes
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    return copy
+
+
+_client_lock = asyncio.Lock()
 
 
 async def get_client() -> TelegramClient:
     """Подключение по цепочке _proxy_chain(): первая техника, через которую
-    удалось connect() + авторизованная сессия, остаётся на всю жизнь процесса."""
+    удалось connect() + авторизованная сессия, остаётся на всю жизнь процесса.
+
+    Под замком: параллельные вызовы тулов иначе открывали по клиенту на один и
+    тот же файл сессии одновременно."""
+    if _client is not None and _client.is_connected():
+        return _client
+    async with _client_lock:
+        return await _connect()
+
+
+async def _connect() -> TelegramClient:
     global _client
     if _client is not None and _client.is_connected():
         return _client
@@ -276,6 +334,12 @@ async def get_client() -> TelegramClient:
         try:
             await client.connect()
         except Exception as e:  # noqa: BLE001
+            if "database is locked" in str(e):
+                # не сеть: файл сессии держит другой процесс, другие прокси тут не помогут
+                raise RuntimeError(
+                    f"Telegram session file is locked by another process: {session}.session "
+                    "(not a network problem). Set TELEGRAM_SESSION to a private copy."
+                ) from e
             errors.append(f"{technique}: {type(e).__name__}: {e}")
             try:
                 await client.disconnect()
