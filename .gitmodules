@@ -1,3 +1,6 @@
 [submodule "whatsapp/gowa"]
 	path = whatsapp/gowa
 	url = https://github.com/vsmelov/go-whatsapp-web-multidevice.git
+[submodule "tg-claude-listener"]
+	path = tg-claude-listener
+	url = git@github.com:vsmelov/tg-claude-listener.git
