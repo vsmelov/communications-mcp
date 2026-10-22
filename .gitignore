@@ -23,3 +23,4 @@ tg-archive/config.yaml*
 duties/registry.json*
 duties/.runtime/
 server.py.bak-*
+.env.bak*
